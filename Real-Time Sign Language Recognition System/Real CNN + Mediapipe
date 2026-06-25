@@ -1,0 +1,373 @@
+# ============================================================
+#  CNN + MediaPipe Hand Crop Model
+#  Input  : Cropped hand image from MediaPipe detection
+#  Output : 29 classes (A-Z + del + nothing + space)
+# ============================================================
+
+import os
+import cv2
+import json
+import numpy as np
+import mediapipe as mp
+from mediapipe.tasks import python
+from mediapipe.tasks.python import vision
+import urllib.request
+import tensorflow as tf
+
+layers = tf.keras.layers
+models = tf.keras.models
+callbacks = tf.keras.callbacks
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import confusion_matrix, classification_report
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+# ─────────────────────────────────────────────
+# CONFIG
+# ─────────────────────────────────────────────
+DATASET_PATH = "ASL_Alphabet_Dataset/asl_alphabet_train"
+
+MODEL_SAVE = "Real_cnn_mediapipe_image_model.keras"
+LABELS_SAVE = "Real_cnn_mediapipe_image_labels.json"
+CACHE_FILE = "Real_cnn_mediapipe_image_data.npz"
+
+IMG_SIZE = 64
+EPOCHS = 15
+BATCH_SIZE = 32
+
+VAL_SIZE = 0.15
+TEST_SIZE = 0.15
+
+# ─────────────────────────────────────────────
+# MEDIAPIPE TASKS SETUP
+# ─────────────────────────────────────────────
+HAND_LANDMARKER_MODEL = "hand_landmarker.task"
+
+if not os.path.exists(HAND_LANDMARKER_MODEL):
+    print("Downloading hand_landmarker.task ...")
+    urllib.request.urlretrieve(
+        "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task",
+        HAND_LANDMARKER_MODEL
+    )
+    print("Downloaded hand_landmarker.task")
+
+
+def create_hand_landmarker():
+    base_options = python.BaseOptions(model_asset_path=HAND_LANDMARKER_MODEL)
+
+    options = vision.HandLandmarkerOptions(
+        base_options=base_options,
+        running_mode=vision.RunningMode.IMAGE,
+        num_hands=1,
+        min_hand_detection_confidence=0.3,
+        min_hand_presence_confidence=0.3,
+        min_tracking_confidence=0.3
+    )
+
+    return vision.HandLandmarker.create_from_options(options)
+
+
+landmarker = create_hand_landmarker()
+
+
+# ─────────────────────────────────────────────
+# CROP HAND USING MEDIAPIPE
+# ─────────────────────────────────────────────
+def crop_hand_with_mediapipe(img):
+    """
+    Use MediaPipe Tasks API to detect hand landmarks,
+    then crop the hand region from the image.
+    Returns cropped hand image or None.
+    """
+
+    if img is None:
+        return None
+
+    h, w = img.shape[:2]
+
+    img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+
+    mp_image = mp.Image(
+        image_format=mp.ImageFormat.SRGB,
+        data=img_rgb
+    )
+
+    result = landmarker.detect(mp_image)
+
+    if not result.hand_landmarks:
+        return None
+
+    landmarks = result.hand_landmarks[0]
+
+    x_coords = []
+    y_coords = []
+
+    for lm in landmarks:
+        x_coords.append(int(lm.x * w))
+        y_coords.append(int(lm.y * h))
+
+    x_min = max(min(x_coords) - 30, 0)
+    y_min = max(min(y_coords) - 30, 0)
+    x_max = min(max(x_coords) + 30, w)
+    y_max = min(max(y_coords) + 30, h)
+
+    hand_crop = img[y_min:y_max, x_min:x_max]
+
+    if hand_crop.size == 0:
+        return None
+
+    hand_crop = cv2.resize(hand_crop, (IMG_SIZE, IMG_SIZE))
+    hand_crop = cv2.cvtColor(hand_crop, cv2.COLOR_BGR2RGB)
+
+    return hand_crop
+
+
+# ─────────────────────────────────────────────
+# LOAD DATASET
+# ─────────────────────────────────────────────
+def load_dataset():
+    if os.path.exists(CACHE_FILE):
+        print(f"Loading cached data from {CACHE_FILE} ...")
+        data = np.load(CACHE_FILE, allow_pickle=True)
+        return data["X"], data["y"], data["labels"].tolist()
+
+    X = []
+    y = []
+    labels = []
+
+    classes = sorted(os.listdir(DATASET_PATH))
+
+    print("Extracting cropped hand images using MediaPipe...")
+
+    for class_id, class_name in enumerate(classes):
+        class_path = os.path.join(DATASET_PATH, class_name)
+
+        if not os.path.isdir(class_path):
+            continue
+
+        labels.append(class_name)
+
+        image_names = os.listdir(class_path)
+        success_count = 0
+
+        for img_name in image_names:
+            img_path = os.path.join(class_path, img_name)
+            img = cv2.imread(img_path)
+
+            if img is None:
+                continue
+
+            # Original image
+            crop = crop_hand_with_mediapipe(img)
+
+            if crop is not None:
+                X.append(crop)
+                y.append(class_id)
+                success_count += 1
+
+            # Flipped image for left/right hand improvement
+            flipped = cv2.flip(img, 1)
+            crop_flipped = crop_hand_with_mediapipe(flipped)
+
+            if crop_flipped is not None:
+                X.append(crop_flipped)
+                y.append(class_id)
+                success_count += 1
+
+        print(f"{class_name}: {success_count} cropped images")
+
+    X = np.array(X, dtype=np.float32)
+    y = np.array(y, dtype=np.int32)
+
+    np.savez(CACHE_FILE, X=X, y=y, labels=labels)
+
+    print("\nDataset saved to cache.")
+    print("X shape:", X.shape)
+    print("y shape:", y.shape)
+    print("Classes:", labels)
+
+    return X, y, labels
+
+
+# ─────────────────────────────────────────────
+# BUILD CNN MODEL
+# ─────────────────────────────────────────────
+def build_cnn_model(num_classes):
+    model = models.Sequential([
+        layers.Input(shape=(IMG_SIZE, IMG_SIZE, 3)),
+
+        layers.Rescaling(1.0 / 255),
+
+        layers.Conv2D(32, (3, 3), activation="relu", padding="same"),
+        layers.MaxPooling2D((2, 2)),
+
+        layers.Conv2D(64, (3, 3), activation="relu", padding="same"),
+        layers.MaxPooling2D((2, 2)),
+
+        layers.Conv2D(128, (3, 3), activation="relu", padding="same"),
+        layers.MaxPooling2D((2, 2)),
+
+        layers.Conv2D(256, (3, 3), activation="relu", padding="same"),
+        layers.MaxPooling2D((2, 2)),
+
+        layers.Flatten(),
+
+        layers.Dense(256, activation="relu"),
+        layers.Dropout(0.4),
+
+        layers.Dense(128, activation="relu"),
+        layers.Dropout(0.3),
+
+        layers.Dense(num_classes, activation="softmax")
+    ])
+
+    return model
+
+
+# ─────────────────────────────────────────────
+# MAIN TRAINING
+# ─────────────────────────────────────────────
+X, y, labels = load_dataset()
+
+num_classes = len(labels)
+
+with open(LABELS_SAVE, "w") as f:
+    json.dump(labels, f)
+
+print("\nLabels saved:", LABELS_SAVE)
+
+# Train / validation / test split
+X_train, X_temp, y_train, y_temp = train_test_split(
+    X,
+    y,
+    test_size=(VAL_SIZE + TEST_SIZE),
+    random_state=42,
+    stratify=y
+)
+
+X_val, X_test, y_val, y_test = train_test_split(
+    X_temp,
+    y_temp,
+    test_size=TEST_SIZE / (VAL_SIZE + TEST_SIZE),
+    random_state=42,
+    stratify=y_temp
+)
+
+print("\nTrain:", len(X_train))
+print("Val  :", len(X_val))
+print("Test :", len(X_test))
+
+y_train_oh = tf.keras.utils.to_categorical(y_train, num_classes)
+y_val_oh = tf.keras.utils.to_categorical(y_val, num_classes)
+y_test_oh = tf.keras.utils.to_categorical(y_test, num_classes)
+
+# Build model
+model = build_cnn_model(num_classes)
+model.summary()
+
+# Compile
+model.compile(
+    optimizer=tf.keras.optimizers.Adam(learning_rate=0.001),
+    loss="categorical_crossentropy",
+    metrics=["accuracy"]
+)
+
+# Callbacks
+cb_list = [
+    callbacks.EarlyStopping(
+        monitor="val_accuracy",
+        patience=5,
+        restore_best_weights=True,
+        verbose=1
+    ),
+
+    callbacks.ReduceLROnPlateau(
+        monitor="val_loss",
+        factor=0.5,
+        patience=3,
+        min_lr=1e-6,
+        verbose=1
+    ),
+
+    callbacks.ModelCheckpoint(
+        MODEL_SAVE,
+        monitor="val_accuracy",
+        save_best_only=True,
+        verbose=1
+    )
+]
+
+# Train
+history = model.fit(
+    X_train,
+    y_train_oh,
+    validation_data=(X_val, y_val_oh),
+    epochs=EPOCHS,
+    batch_size=BATCH_SIZE,
+    callbacks=cb_list
+)
+
+# Evaluate
+best_model = tf.keras.models.load_model(MODEL_SAVE)
+
+loss, acc = best_model.evaluate(X_test, y_test_oh, verbose=1)
+
+print(f"\nCNN + MediaPipe Test Accuracy: {acc * 100:.2f}%")
+print(f"CNN + MediaPipe Test Loss    : {loss:.4f}")
+
+# Prediction
+y_pred = best_model.predict(X_test).argmax(axis=1)
+
+# Confusion matrix
+cm = confusion_matrix(y_test, y_pred)
+
+plt.figure(figsize=(16, 14))
+sns.heatmap(
+    cm,
+    annot=True,
+    fmt="d",
+    cmap="Blues",
+    xticklabels=labels,
+    yticklabels=labels
+)
+
+plt.title("CNN + MediaPipe Confusion Matrix")
+plt.xlabel("Predicted Label")
+plt.ylabel("True Label")
+plt.tight_layout()
+plt.savefig("cnn_mediapipe_confusion_matrix.png", dpi=150)
+plt.show()
+
+# Training graph
+plt.figure(figsize=(8, 5))
+plt.plot(history.history["accuracy"], label="Train Accuracy")
+plt.plot(history.history["val_accuracy"], label="Validation Accuracy")
+plt.title("CNN + MediaPipe Accuracy")
+plt.xlabel("Epoch")
+plt.ylabel("Accuracy")
+plt.legend()
+plt.grid(True, alpha=0.3)
+plt.tight_layout()
+plt.savefig("cnn_mediapipe_accuracy.png", dpi=150)
+plt.show()
+
+plt.figure(figsize=(8, 5))
+plt.plot(history.history["loss"], label="Train Loss")
+plt.plot(history.history["val_loss"], label="Validation Loss")
+plt.title("CNN + MediaPipe Loss")
+plt.xlabel("Epoch")
+plt.ylabel("Loss")
+plt.legend()
+plt.grid(True, alpha=0.3)
+plt.tight_layout()
+plt.savefig("cnn_mediapipe_loss.png", dpi=150)
+plt.show()
+
+# Classification report
+print("\nClassification Report:")
+print(classification_report(y_test, y_pred, target_names=labels))
+
+print("\nDone!")
+print("Model saved:", MODEL_SAVE)
+print("Labels saved:", LABELS_SAVE)
+print("Cache saved :", CACHE_FILE)

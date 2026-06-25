@@ -1,0 +1,292 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Real-Time ASL Recognition</title>
+
+  <style>
+    body {
+      font-family: Arial, sans-serif;
+      margin: 0;
+      padding: 24px;
+      background: #111827;
+      color: #f3f4f6;
+    }
+
+    h1 {
+      margin-top: 0;
+      font-size: 24px;
+      text-align: center;
+    }
+
+    .container {
+      display: grid;
+      grid-template-columns: 2fr 1fr;
+      gap: 16px;
+      max-width: 1200px;
+      margin: 0 auto;
+    }
+
+    .card {
+      background: #1f2937;
+      border-radius: 12px;
+      padding: 16px;
+      box-shadow: 0 2px 8px rgba(0, 0, 0, 0.2);
+    }
+
+    .stream {
+      width: 100%;
+      border-radius: 8px;
+      border: 1px solid #374151;
+      background: #000;
+    }
+
+    .label {
+      color: #9ca3af;
+      font-size: 13px;
+      margin-top: 14px;
+      margin-bottom: 6px;
+    }
+
+    .value {
+      font-size: 22px;
+      font-weight: bold;
+      white-space: normal;
+      overflow-wrap: break-word;
+      word-break: break-word;
+    }
+
+    .sentence-box {
+      min-height: 120px;
+      border: 1px solid #374151;
+      border-radius: 8px;
+      padding: 10px;
+      background: #111827;
+      font-size: 20px;
+      line-height: 1.4;
+
+      white-space: pre-wrap;
+      overflow-wrap: break-word;
+      word-break: break-word;
+      max-width: 100%;
+    }
+
+    button {
+      background: #2563eb;
+      border: none;
+      color: #fff;
+      padding: 10px 14px;
+      border-radius: 8px;
+      cursor: pointer;
+      margin-top: 14px;
+      font-size: 14px;
+    }
+
+    button:hover {
+      background: #1d4ed8;
+    }
+
+    /* Scroll wrapper for suggestion boxes */
+    .suggestion-scroll-wrapper {
+      width: 100%;
+      overflow-x: auto;
+      overflow-y: hidden;
+      padding-bottom: 10px;
+      margin-top: 8px;
+    }
+
+    .suggestion-scroll-wrapper::-webkit-scrollbar {
+      height: 8px;
+    }
+
+    .suggestion-scroll-wrapper::-webkit-scrollbar-track {
+      background: #111827;
+      border-radius: 8px;
+    }
+
+    .suggestion-scroll-wrapper::-webkit-scrollbar-thumb {
+      background: #374151;
+      border-radius: 8px;
+    }
+
+    .suggestion-scroll-wrapper::-webkit-scrollbar-thumb:hover {
+      background: #4b5563;
+    }
+
+    /*
+      This keeps the six-box style:
+      3 rows x 2 columns visible.
+      More words continue to the right.
+    */
+    .suggestion-grid {
+      display: grid;
+      grid-auto-flow: column;
+      grid-template-rows: repeat(3, 54px);
+      grid-auto-columns: 48%;
+      gap: 10px;
+      margin-top: 8px;
+    }
+
+    .suggestion-box {
+      background: #111827;
+      border: 1px solid #374151;
+      border-radius: 8px;
+      padding: 12px;
+      text-align: center;
+      font-size: 18px;
+      font-weight: bold;
+
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .suggestion-box.clickable {
+      cursor: pointer;
+    }
+
+    .suggestion-box.clickable:hover {
+      background: #1e293b;
+      border-color: #2563eb;
+    }
+
+    @media (max-width: 900px) {
+      .container {
+        grid-template-columns: 1fr;
+      }
+    }
+  </style>
+</head>
+
+<body>
+  <h1>Real-Time Sign Language Recognition</h1>
+
+  <div class="container">
+    <div class="card">
+      <img class="stream" src="/video_feed" alt="Live webcam stream" />
+    </div>
+
+    <div class="card">
+      <div class="label">Detected Sign</div>
+      <div id="token" class="value">-</div>
+
+      <div class="label">Confidence</div>
+      <div id="confidence" class="value">0.00</div>
+
+      <div class="label">FPS</div>
+      <div id="fps" class="value">0.0</div>
+
+      <div class="label">Constructed Sentence</div>
+      <div id="sentence" class="sentence-box">-</div>
+
+      <div class="label">Word Suggestions</div>
+
+      <div class="suggestion-scroll-wrapper">
+        <div id="suggestions" class="suggestion-grid">
+          <div class="suggestion-box">-</div>
+          <div class="suggestion-box">-</div>
+          <div class="suggestion-box">-</div>
+          <div class="suggestion-box">-</div>
+          <div class="suggestion-box">-</div>
+          <div class="suggestion-box">-</div>
+        </div>
+      </div>
+
+      <button id="deleteBtn">Delete Last</button>
+      <button id="clearBtn">Clear Sentence</button>
+    </div>
+  </div>
+
+  <script>
+    // Delete last character
+    document.getElementById("deleteBtn")
+      .addEventListener("click", async () => {
+        await fetch("/delete_last", {
+          method: "POST"
+        });
+
+        await refreshStatus();
+      });
+
+    async function refreshStatus() {
+      try {
+        const res = await fetch("/status");
+        const data = await res.json();
+
+        // Main information
+        document.getElementById("token").textContent =
+          data.token || "-";
+
+        document.getElementById("confidence").textContent =
+          (data.confidence ?? 0).toFixed(2);
+
+        document.getElementById("fps").textContent =
+          (data.fps ?? 0).toFixed(1);
+
+        document.getElementById("sentence").textContent =
+          data.sentence || "-";
+
+        // Word suggestions with six-box format + horizontal scroll
+        const suggestions = data.suggestions || [];
+        const box = document.getElementById("suggestions");
+
+        box.innerHTML = "";
+
+        if (suggestions.length === 0) {
+          for (let i = 0; i < 6; i++) {
+            const div = document.createElement("div");
+            div.className = "suggestion-box";
+            div.textContent = "-";
+            box.appendChild(div);
+          }
+        } else {
+          for (let i = 0; i < suggestions.length; i++) {
+            const div = document.createElement("div");
+            div.className = "suggestion-box clickable";
+
+            const word = suggestions[i];
+
+            div.textContent = word;
+            div.title = word;
+
+            div.onclick = async () => {
+              await fetch("/select_word", {
+                method: "POST",
+                headers: {
+                  "Content-Type": "application/json"
+                },
+                body: JSON.stringify({
+                  word: word
+                })
+              });
+
+              await refreshStatus();
+            };
+
+            box.appendChild(div);
+          }
+        }
+
+      } catch (err) {
+        console.log(err);
+      }
+    }
+
+    // Clear sentence
+    document.getElementById("clearBtn")
+      .addEventListener("click", async () => {
+        await fetch("/clear", {
+          method: "POST"
+        });
+
+        await refreshStatus();
+      });
+
+    // Auto refresh every 250ms
+    setInterval(refreshStatus, 250);
+
+    refreshStatus();
+  </script>
+</body>
+</html>
